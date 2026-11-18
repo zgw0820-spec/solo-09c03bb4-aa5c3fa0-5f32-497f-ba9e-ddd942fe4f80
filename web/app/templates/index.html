@@ -62,6 +62,12 @@
       <label class="check"><input type="checkbox" name="drop_receipt" value="true"> 模拟丢回执</label>
       <button type="submit">提交指令</button>
     </form>
+    <form method="get" onsubmit="window.location='/devices/'+encodeURIComponent(this.device_id.value);return false;" style="margin-top:12px; grid-template-columns: 1fr auto; display:grid; gap:12px; align-items:end; max-width:420px">
+      <label>恢复核查（按设备号）
+        <input type="text" name="device_id" placeholder="edge-rack-01" required>
+      </label>
+      <button type="submit" class="secondary">打开核查页</button>
+    </form>
   </div>
 
   <div class="card">
@@ -76,10 +82,11 @@
       <tbody>
         {% for r in rows %}
         <tr>
-          <td>{{ r.device_id }}</td>
+          <td><a href="/devices/{{ r.device_id }}">{{ r.device_id }}</a></td>
           <td><a href="/commands/{{ r.command_id }}"><code>{{ r.command_id }}</code></a></td>
           <td><span class="badge s-{{ r.state }}">{{ r.state_label }}</span>
-              {% if r.receipt_lost %}<div class="muted">回执丢失，核实中</div>{% endif %}</td>
+              {% if r.receipt_lost %}<div class="muted">回执丢失，核实中</div>{% endif %}
+              {% if r.boot_generation is not none %}<div class="muted">新代次 {{ r.boot_generation }}</div>{% endif %}</td>
           <td>{{ r.detail or '' }}</td>
           <td>{{ r.attempts }}</td>
           <td class="muted">{{ r.deadline }}</td>
@@ -89,6 +96,7 @@
               <button class="secondary" type="submit">触发丢回执</button>
             </form>
             {% else %}<span class="muted">已结案</span>{% endif %}
+            <a href="/devices/{{ r.device_id }}">恢复核查</a>
           </td>
         </tr>
         {% else %}

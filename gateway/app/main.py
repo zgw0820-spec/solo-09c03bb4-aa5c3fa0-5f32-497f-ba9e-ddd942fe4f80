@@ -9,6 +9,15 @@ POST /api/commands/{id}/drop-receipt
                           committing the execution (simulates a lost receipt
                           on the way back to the operations web)
 GET  /api/executions      what was really executed (demo / audit view)
+
+Simulated device reporting (recovery verification)
+--------------------------------------------------
+POST /api/devices/{id}/reports          emit an online/offline report; the
+                                        gateway stamps generation + per-gen
+                                        sequence, callers cannot supply them
+POST /api/devices/{id}/reports/release  release held reports (late arrival)
+GET  /api/devices/{id}                  current boot generation
+GET  /api/devices/{id}/reports          report log (arrived + held)
 """
 from __future__ import annotations
 
@@ -49,6 +58,19 @@ def receipt_payload(row) -> dict:
         "status": row["receipt_status"],
         "executions": row["executions"],
         "executed_at": row["executed_at"],
+        "boot_generation": row["boot_generation"],
+    }
+
+
+def report_payload(row) -> dict:
+    return {
+        "device_id": row["device_id"],
+        "generation": row["generation"],
+        "seq": row["seq"],
+        "online": bool(row["online"]),
+        "arrived": bool(row["arrived"]),
+        "emitted_at": row["emitted_at"],
+        "arrived_at": row["arrived_at"],
     }
 
 
@@ -132,3 +154,48 @@ def drop_receipt(command_id: str):
 @app.get("/api/executions")
 def executions(limit: int = 100) -> list[dict]:
     return [receipt_payload(r) for r in store.list(limit)]
+
+
+class ReportIn(BaseModel):
+    online: bool
+    # "current": the report arrives immediately; "hold": emitted now (the
+    # gateway stamps generation + seq at once) but stuck in the network
+    # until released -- an honest late/old report.
+    mode: str = Field(default="current", pattern="^(current|hold)$")
+
+
+@app.post("/api/devices/{device_id}/reports", status_code=201)
+def emit_report(device_id: str, payload: ReportIn):
+    row = store.add_report(
+        device_id, online=payload.online, arrive=payload.mode != "hold"
+    )
+    return report_payload(row)
+
+
+@app.post("/api/devices/{device_id}/reports/release")
+def release_reports(device_id: str):
+    released = store.release_reports(device_id)
+    return {"device_id": device_id, "released": released}
+
+
+@app.get("/api/devices/{device_id}")
+def device_state(device_id: str):
+    row = store.get_device(device_id)
+    return {
+        "device_id": device_id,
+        # A device that never rebooted via this gateway is generation 0.
+        "generation": row["generation"] if row is not None else 0,
+        "known": row is not None,
+    }
+
+
+@app.get("/api/devices/{device_id}/reports")
+def list_reports(device_id: str, limit: int = 100):
+    dev = store.get_device(device_id)
+    rows = store.list_reports(device_id, limit)
+    return {
+        "device_id": device_id,
+        "generation": dev["generation"] if dev is not None else 0,
+        "known": dev is not None,
+        "reports": [report_payload(r) for r in rows],
+    }

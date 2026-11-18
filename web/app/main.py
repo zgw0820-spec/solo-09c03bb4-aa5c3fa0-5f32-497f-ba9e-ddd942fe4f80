@@ -1,10 +1,12 @@
-"""Operations web: submit reboot commands, watch progress, simulate loss."""
+"""Operations web: submit reboot commands, watch progress, simulate loss,
+and verify whether a device actually came back online afterwards."""
 from __future__ import annotations
 
 import os
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from urllib.parse import quote
 
 from fastapi import FastAPI, Form, HTTPException, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
@@ -12,6 +14,7 @@ from fastapi.templating import Jinja2Templates
 import httpx
 
 from .dispatcher import Dispatcher
+from .recovery import GatewayUnreachable, compute_conclusion
 from .store import DISPLAY, CommandIdConflict, Store
 
 DB_PATH = os.environ.get("OPS_DB", "/data/ops.db")
@@ -48,9 +51,50 @@ def row_to_dict(row) -> dict:
         "detail": row["detail"],
         "attempts": row["attempts"],
         "receipt_lost": bool(row["receipt_lost"]),
+        "boot_generation": row["boot_generation"],
         "created_at": row["created_at"],
         "updated_at": row["updated_at"],
     }
+
+
+# ------------------------------------------------------------ gateway client
+def _gw_get(path: str) -> dict:
+    try:
+        resp = httpx.get(f"{GATEWAY_URL.rstrip('/')}{path}", timeout=2.0)
+    except httpx.HTTPError as exc:
+        raise GatewayUnreachable(str(exc)) from exc
+    if resp.status_code == 404:
+        return {}
+    if resp.status_code != 200:
+        raise GatewayUnreachable(f"HTTP {resp.status_code}")
+    return resp.json()
+
+
+def _gw_post(path: str, payload: dict) -> dict:
+    try:
+        resp = httpx.post(f"{GATEWAY_URL.rstrip('/')}{path}", json=payload, timeout=2.0)
+    except httpx.HTTPError as exc:
+        raise GatewayUnreachable(str(exc)) from exc
+    if resp.status_code >= 400:
+        raise GatewayUnreachable(f"HTTP {resp.status_code}")
+    return resp.json()
+
+
+def fetch_reports(device_id: str) -> dict:
+    return _gw_get(f"/api/devices/{device_id}/reports")
+
+
+def fetch_command(command_id: str) -> dict:
+    return _gw_get(f"/api/commands/{command_id}")
+
+
+def recovery_conclusion(device_id: str) -> dict:
+    return compute_conclusion(
+        device_id,
+        store=store,
+        fetch_reports=fetch_reports,
+        fetch_command=fetch_command,
+    )
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -157,3 +201,79 @@ def drop_receipt(command_id: str):
 @app.get("/healthz")
 def healthz():
     return {"ok": True}
+
+
+# ------------------------------------------------------- recovery verification
+@app.get("/devices/{device_id}", response_class=HTMLResponse)
+def device_recovery(request: Request, device_id: str, error: str = ""):
+    conclusion = recovery_conclusion(device_id)
+    try:
+        gw = fetch_reports(device_id)
+        gateway_ok = True
+    except GatewayUnreachable:
+        gw = {"generation": None, "reports": []}
+        gateway_ok = False
+    reports = sorted(
+        gw.get("reports", []),
+        key=lambda r: (r["generation"], r["seq"]),
+        reverse=True,
+    )
+    return templates.TemplateResponse(
+        request,
+        "recovery.html",
+        {
+            "device_id": device_id,
+            "conclusion": conclusion,
+            "gateway_ok": gateway_ok,
+            "gateway_generation": gw.get("generation"),
+            "reports": reports,
+            "held": [r for r in reports if not r["arrived"]],
+            "error": error,
+            "now": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        },
+    )
+
+
+@app.get("/api/devices/{device_id}/recovery")
+def api_device_recovery(device_id: str):
+    return recovery_conclusion(device_id)
+
+
+@app.post("/devices/{device_id}/report")
+def device_report(
+    device_id: str,
+    online: bool = Form(...),
+    mode: str = Form("current"),
+):
+    """Ask the gateway's simulated device to emit a report.
+
+    The generation and sequence number are assigned by the gateway; this
+    endpoint deliberately accepts no such fields.
+    """
+    if mode not in ("current", "hold"):
+        raise HTTPException(status_code=400, detail="非法的回报方式")
+    try:
+        _gw_post(
+            f"/api/devices/{device_id}/reports",
+            {"online": online, "mode": mode},
+        )
+    except GatewayUnreachable as exc:
+        return RedirectResponse(
+            url=f"/devices/{device_id}?error={quote(f'网关不可达，回报未记录（{exc}）')}",
+            status_code=303,
+        )
+    return RedirectResponse(url=f"/devices/{device_id}", status_code=303)
+
+
+@app.post("/devices/{device_id}/release")
+def device_release(device_id: str):
+    """Release the device's held reports: they arrive late, keeping their
+    original gateway-assigned (generation, seq)."""
+    try:
+        _gw_post(f"/api/devices/{device_id}/reports/release", {})
+    except GatewayUnreachable as exc:
+        return RedirectResponse(
+            url=f"/devices/{device_id}?error={quote(f'网关不可达，无法释放挂起回报（{exc}）')}",
+            status_code=303,
+        )
+    return RedirectResponse(url=f"/devices/{device_id}", status_code=303)

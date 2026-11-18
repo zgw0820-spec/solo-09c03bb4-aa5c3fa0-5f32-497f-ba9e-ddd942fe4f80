@@ -140,6 +140,7 @@ class Dispatcher:
                     state="executed" if status == "succeeded" else "failed",
                     receipt_status=status,
                     detail="网关回执：执行成功" if status == "succeeded" else "网关回执：执行失败",
+                    boot_generation=body.get("boot_generation"),
                 )
                 return
             if gw_state == "unknown":
@@ -209,6 +210,7 @@ class Dispatcher:
                     receipt_status=status,
                     detail=f"按指令号核实：网关已{'成功' if status == 'succeeded' else '失败'}执行"
                     f"（执行次数 {body.get('executions')}）",
+                    boot_generation=body.get("boot_generation"),
                 )
             elif state == "unknown":
                 # Gateway restarted mid-execution: the outcome is genuinely

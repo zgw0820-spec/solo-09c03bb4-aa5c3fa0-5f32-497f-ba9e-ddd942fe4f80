@@ -12,6 +12,10 @@
 #   6. restart of both services -> unfinished work resumes, nothing re-executed;
 #   7. gateway killed mid-execution -> id frozen as unknown, web keeps it
 #      unresolved and blocks that device; the id is never executed.
+#   8. recovery verification: boot generation issued on success, online ->
+#      recovered, newer offline withdraws, late old reports (old seq / old
+#      generation) cannot override, new command resets the conclusion, and
+#      the conclusion survives a restart of both services.
 #
 # Expiry rules (unexecuted vs. still-verifying) are covered by pytest at
 # second granularity; the web form only accepts whole minutes.
@@ -86,6 +90,21 @@ submit() { # device command minutes [drop]
 }
 gw_get() { curl -sS "http://127.0.0.1:$GW_PORT/api/commands/$1"; }
 gw_code() { curl -sS -o /dev/null -w '%{http_code}' "http://127.0.0.1:$GW_PORT/api/commands/$1"; }
+report() { # device online(true|false) [mode]
+  curl -sS -o /dev/null -w '%{http_code}' -X POST "http://127.0.0.1:$WEB_PORT/devices/$1/report" \
+    --data-urlencode "online=$2" --data-urlencode "mode=${3:-current}"
+}
+release() { curl -sS -o /dev/null -X POST "http://127.0.0.1:$WEB_PORT/devices/$1/release"; }
+conclusion() { curl -sS "http://127.0.0.1:$WEB_PORT/api/devices/$1/recovery" | field conclusion; }
+expect_conclusion() { # device expected
+  local got
+  got="$(conclusion "$1")"
+  if [ "$got" != "$2" ]; then
+    echo "FAIL: $1 conclusion=$got, expected $2" >&2
+    exit 1
+  fi
+  echo "$1 conclusion: $got (as expected)"
+}
 
 start_gateway
 start_web
@@ -159,9 +178,57 @@ wait_http "http://127.0.0.1:$WEB_PORT/healthz"
 wait_state resume-1 executed
 echo "resume-1 after restart: $(curl -sS "http://127.0.0.1:$WEB_PORT/api/commands/resume-1")"
 
+echo "-- [8] recovery verification"
+submit device-R rec-1 5 >/dev/null
+wait_state rec-1 executed
+echo "rec-1 executed, boot_generation=$(curl -sS "http://127.0.0.1:$WEB_PORT/api/commands/rec-1" | field boot_generation)"
+expect_conclusion device-R verify          # executed, but no report yet
+
+report device-R true >/dev/null
+expect_conclusion device-R recovered       # new generation reports online
+
+report device-R false >/dev/null
+expect_conclusion device-R not_recovered   # newer offline withdraws it
+
+report device-R false hold >/dev/null      # held: gen1 seq3
+report device-R true >/dev/null            # gen1 seq4 arrives first
+release device-R                           # late seq3 (offline) arrives
+expect_conclusion device-R recovered       # old seq cannot override
+
+report device-R true hold >/dev/null       # held: gen1 seq5
+submit device-R rec-2 5 >/dev/null
+expect_conclusion device-R verify          # new command: old conclusion gone
+wait_state rec-2 executed                  # gateway issues generation 2
+release device-R                           # stale gen1 report arrives late
+expect_conclusion device-R verify          # old generation is not evidence
+
+report device-R true >/dev/null            # gen2 seq1
+expect_conclusion device-R recovered
+report device-R false >/dev/null           # gen2 seq2
+expect_conclusion device-R not_recovered
+echo "device-R at gateway: $(curl -sS "http://127.0.0.1:$GW_PORT/api/devices/device-R")"
+
+echo "-- [8b] recovery survives a restart of both services"
+stop_web
+stop_gateway
+start_gateway
+start_web
+wait_http "http://127.0.0.1:$WEB_PORT/healthz"
+wait_http "http://127.0.0.1:$GW_PORT/healthz"
+expect_conclusion device-R not_recovered   # persisted: gen2 latest = offline
+report device-R true >/dev/null            # gen2 seq3
+expect_conclusion device-R recovered
+
+echo "-- [8c] gateway unreachable -> verify, never a stale conclusion"
+stop_gateway
+expect_conclusion device-R verify
+start_gateway
+wait_http "http://127.0.0.1:$GW_PORT/healthz"
+expect_conclusion device-R recovered
+
 sleep 0.5
 echo "-- final states"
-for c in ok-1 ok-2 ok-3 live-1 resume-1 kill-1 kill-2 kill-3; do
+for c in ok-1 ok-2 ok-3 live-1 resume-1 kill-1 kill-2 kill-3 rec-1 rec-2; do
   printf '%s=%s ' "$c" "$(web_state "$c")"
 done
 echo
@@ -174,7 +241,8 @@ port = sys.argv[1]
 rows = json.load(urllib.request.urlopen(f"http://127.0.0.1:{port}/api/executions"))
 by_id = {r["command_id"]: r for r in rows}
 
-must_execute_once = ["ok-1", "ok-2", "ok-3", "live-1", "resume-1", "kill-3"]
+must_execute_once = ["ok-1", "ok-2", "ok-3", "live-1", "resume-1", "kill-3",
+                     "rec-1", "rec-2"]
 for cid in must_execute_once:
     assert cid in by_id, f"{cid} missing at gateway"
     assert by_id[cid]["state"] == "executed", by_id[cid]
@@ -183,8 +251,25 @@ for cid in must_execute_once:
 assert by_id.get("kill-1", {}).get("state") == "unknown", by_id.get("kill-1")
 assert by_id.get("kill-1", {}).get("executions", 0) == 0, by_id.get("kill-1")
 assert "kill-2" not in by_id, "kill-2 must never reach the gateway while blocked"
+
+# Boot generations issued by successful executions, in device order.
+assert by_id["rec-1"]["boot_generation"] == 1, by_id["rec-1"]
+assert by_id["rec-2"]["boot_generation"] == 2, by_id["rec-2"]
+dev = json.load(urllib.request.urlopen(f"http://127.0.0.1:{port}/api/devices/device-R"))
+assert dev["generation"] == 2, dev
+reports = json.load(
+    urllib.request.urlopen(f"http://127.0.0.1:{port}/api/devices/device-R/reports")
+)["reports"]
+arrived = [r for r in reports if r["arrived"]]
+assert arrived, "expected arrived reports for device-R"
+gen2 = [r for r in arrived if r["generation"] == 2]
+assert gen2 and max(r["seq"] for r in gen2) >= 3, gen2
+# Every report carries a gateway-assigned (generation, seq) pair, unique per boot.
+stamps = {(r["generation"], r["seq"]) for r in reports}
+assert len(stamps) == len(reports), "duplicate (generation, seq) stamps"
 print("executed exactly once:", ", ".join(must_execute_once))
 print("kill-1 frozen as unknown, kill-2 never delivered")
+print("device-R generation=2, reports carry unique gateway stamps")
 PYCHECK
 
 echo "== PASS =="

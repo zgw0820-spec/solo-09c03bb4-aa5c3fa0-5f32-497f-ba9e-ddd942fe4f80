@@ -1,0 +1,124 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>恢复核查 · {{ device_id }}</title>
+<style>
+  body { font-family: system-ui, "Noto Sans SC", sans-serif; margin: 0; background:#f5f6f8; color:#1f2328; }
+  main { max-width: 980px; margin: 32px auto; padding: 0 20px; }
+  h1 { font-size: 20px; margin: 0 0 4px; }
+  a { color:#1f6feb; }
+  .card { background:#fff; border:1px solid #d8dee4; border-radius:8px; padding:20px; margin-top:20px; }
+  .muted { color:#6e7781; font-size:12px; }
+  .conclusion { display:flex; align-items:center; gap:14px; }
+  .verdict { font-size:22px; font-weight:700; padding:8px 18px; border-radius:8px; }
+  .v-recovered { background:#dafbe1; color:#116329; }
+  .v-not_recovered { background:#ffebe9; color:#a40e26; }
+  .v-verify { background:#fff8c5; color:#7d4e00; }
+  .v-none { background:#eaeef2; color:#424a53; }
+  .detail-grid { display:grid; grid-template-columns: 170px 1fr; gap:10px 16px; font-size:14px; }
+  .detail-grid dt { color:#57606a; }
+  .detail-grid dd { margin:0; }
+  table { width:100%; border-collapse:collapse; font-size:13px; }
+  th, td { text-align:left; padding:8px 10px; border-bottom:1px solid #eaeef2; vertical-align:top; }
+  th { color:#57606a; font-weight:600; background:#f6f8fa; }
+  .badge { display:inline-block; padding:2px 8px; border-radius:999px; font-size:12px; font-weight:600; }
+  .b-online { background:#dafbe1; color:#116329; }
+  .b-offline { background:#ffebe9; color:#a40e26; }
+  .b-held { background:#fff8c5; color:#7d4e00; }
+  .b-stale { background:#f6f8fa; color:#6e7781; }
+  button { padding:8px 14px; border:0; border-radius:6px; background:#1f6feb; color:#fff; font-size:13px; cursor:pointer; }
+  button.secondary { background:#eaeef2; color:#24292f; }
+  button.warn { background:#9a6700; }
+  .actions { display:flex; gap:10px; flex-wrap:wrap; align-items:center; }
+  .actions form { display:inline; }
+  .notice { background:#ddf4ff; border:1px solid #54aeff; border-radius:6px; padding:10px 12px; font-size:13px; margin-top:12px; }
+  .error { background:#ffebe9; border:1px solid #ff8182; padding:10px 12px; border-radius:6px; font-size:13px; margin-top:12px; }
+  code { background:#f6f8fa; padding:1px 5px; border-radius:4px; }
+</style>
+</head>
+<body>
+<main>
+  <p><a href="/">← 返回指令列表</a></p>
+  <h1>恢复核查 · 设备 <code>{{ device_id }}</code></h1>
+  <p class="muted">页面每 2 秒刷新 · 服务器时间 {{ now }} · 恢复依据仅来自网关回报记录，页面不接受手填代次</p>
+
+  {% if error %}<div class="error">{{ error }}</div>{% endif %}
+  {% if not gateway_ok %}
+  <div class="error">网关不可达：无法获取设备回报，结论按“待核实”处理。</div>
+  {% endif %}
+
+  <div class="card">
+    <div class="conclusion">
+      <span class="verdict v-{{ conclusion.conclusion }}">{{ conclusion.label }}</span>
+      <span>{{ conclusion.reason }}</span>
+    </div>
+    <dl class="detail-grid" style="margin-top:16px">
+      <dt>最近一条重启指令</dt>
+      <dd>{% if conclusion.command_id %}<a href="/commands/{{ conclusion.command_id }}"><code>{{ conclusion.command_id }}</code></a>
+          （{{ conclusion.command_state_label }}）{% else %}—{% endif %}</dd>
+      <dt>指令执行产生的新代次</dt>
+      <dd>{{ conclusion.boot_generation if conclusion.boot_generation is not none else '—' }}</dd>
+      <dt>网关当前设备代次</dt>
+      <dd>{{ gateway_generation if gateway_generation is not none else '—（网关不可达）' }}</dd>
+      <dt>判定依据的最新回报</dt>
+      <dd>{% if conclusion.latest_report %}代次 {{ conclusion.latest_report.generation }} · 序号 {{ conclusion.latest_report.seq }} ·
+          {{ '在线' if conclusion.latest_report.online else '离线' }}{% else %}—{% endif %}</dd>
+    </dl>
+  </div>
+
+  <div class="card">
+    <strong style="font-size:15px">模拟设备回报</strong>
+    <p class="muted">由网关为回报盖上当前代次与代次内序号；挂起的回报在释放时才到达，仍保留原代次与序号（用于模拟迟到的旧回报）。</p>
+    <div class="actions">
+      <form method="post" action="/devices/{{ device_id }}/report">
+        <input type="hidden" name="online" value="true"><input type="hidden" name="mode" value="current">
+        <button type="submit">设备上报在线</button>
+      </form>
+      <form method="post" action="/devices/{{ device_id }}/report">
+        <input type="hidden" name="online" value="false"><input type="hidden" name="mode" value="current">
+        <button type="submit" class="warn">设备上报离线</button>
+      </form>
+      <form method="post" action="/devices/{{ device_id }}/report">
+        <input type="hidden" name="online" value="true"><input type="hidden" name="mode" value="hold">
+        <button type="submit" class="secondary">挂起在线回报</button>
+      </form>
+      <form method="post" action="/devices/{{ device_id }}/report">
+        <input type="hidden" name="online" value="false"><input type="hidden" name="mode" value="hold">
+        <button type="submit" class="secondary">挂起离线回报</button>
+      </form>
+      <form method="post" action="/devices/{{ device_id }}/release">
+        <button type="submit" class="secondary">释放挂起回报（{{ held | length }} 条在路上）</button>
+      </form>
+    </div>
+  </div>
+
+  <div class="card">
+    <strong style="font-size:15px">网关回报记录</strong>
+    <span class="muted">（最近 {{ reports | length }} 条，按代次内序号倒序）</span>
+    <table style="margin-top:10px">
+      <thead><tr><th>代次</th><th>序号</th><th>内容</th><th>状态</th><th>发出时间</th><th>到达时间</th></tr></thead>
+      <tbody>
+        {% for r in reports %}
+        <tr>
+          <td>{{ r.generation }}
+            {% if gateway_generation is not none and r.generation < gateway_generation %}<span class="badge b-stale">旧代次</span>{% endif %}
+          </td>
+          <td>{{ r.seq }}</td>
+          <td><span class="badge {{ 'b-online' if r.online else 'b-offline' }}">{{ '在线' if r.online else '离线' }}</span></td>
+          <td>{% if r.arrived %}已到达{% else %}<span class="badge b-held">挂起中</span>{% endif %}</td>
+          <td class="muted">{{ r.emitted_at }}</td>
+          <td class="muted">{{ r.arrived_at or '—' }}</td>
+        </tr>
+        {% else %}
+        <tr><td colspan="6" class="muted">暂无回报</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</main>
+<script>
+  setTimeout(() => window.location.reload(), 2000);
+</script>
+</body>
+</html>

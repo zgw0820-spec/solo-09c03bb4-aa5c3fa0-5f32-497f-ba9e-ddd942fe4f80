@@ -52,6 +52,7 @@ CREATE TABLE IF NOT EXISTS commands (
     drop_receipt    INTEGER NOT NULL DEFAULT 0,
     receipt_lost    INTEGER NOT NULL DEFAULT 0,
     wire_state      TEXT,
+    boot_generation INTEGER,
     last_attempt_at TEXT,
     created_at      TEXT NOT NULL,
     updated_at      TEXT NOT NULL
@@ -122,6 +123,14 @@ class Store:
     def init(self) -> None:
         with self.connect() as conn:
             conn.executescript(SCHEMA)
+            # Migration for databases created before boot generations existed.
+            cols = {
+                row["name"] for row in conn.execute("PRAGMA table_info(commands)")
+            }
+            if "boot_generation" not in cols:
+                conn.execute(
+                    "ALTER TABLE commands ADD COLUMN boot_generation INTEGER"
+                )
 
     # ------------------------------------------------------------------ reads
     def get(self, command_id: str) -> Optional[sqlite3.Row]:
@@ -141,6 +150,16 @@ class Store:
             return conn.execute(
                 "SELECT * FROM commands WHERE state='inflight' ORDER BY id"
             ).fetchall()
+
+    def latest_command_for_device(self, device_id: str) -> Optional[sqlite3.Row]:
+        """The most recently submitted command for a device (submission order
+        = id order).  Recovery conclusions always refer to this row, so a
+        newer command automatically supersedes any older conclusion."""
+        with self.connect() as conn:
+            return conn.execute(
+                "SELECT * FROM commands WHERE device_id=? ORDER BY id DESC LIMIT 1",
+                (device_id,),
+            ).fetchone()
 
     def counts(self) -> dict[str, int]:
         with self.connect() as conn:
@@ -339,13 +358,32 @@ class Store:
         state: str,
         receipt_status: Optional[str] = None,
         detail: Optional[str] = None,
+        boot_generation: Optional[int] = None,
     ) -> bool:
-        """Conditional transition out of inflight; only the first wins."""
+        """Conditional transition out of inflight; only the first wins.
+
+        ``boot_generation`` is the generation the gateway issued for this
+        execution; it is a fact about the one execution and is never
+        overwritten once set.
+        """
         with self._tx() as conn:
             cur = conn.execute(
                 "UPDATE commands SET state=?, receipt_status=?, detail=?, "
-                "updated_at=? WHERE command_id=? AND state='inflight'",
-                (state, receipt_status, detail, utcnow(), command_id),
+                "boot_generation=COALESCE(?, boot_generation), updated_at=? "
+                "WHERE command_id=? AND state='inflight'",
+                (state, receipt_status, detail, boot_generation, utcnow(), command_id),
+            )
+            return cur.rowcount == 1
+
+    def set_boot_generation(self, command_id: str, generation: int) -> bool:
+        """Backfill the boot generation for an already-finished command
+        (e.g. a record written before generations existed), fetched from the
+        gateway's authoritative execution record."""
+        with self._tx() as conn:
+            cur = conn.execute(
+                "UPDATE commands SET boot_generation=? "
+                "WHERE command_id=? AND boot_generation IS NULL",
+                (generation, command_id),
             )
             return cur.rowcount == 1
 

@@ -349,3 +349,158 @@ def test_gateway_restart_mid_flight_freezes_id(services, monkeypatch):
         assert gw_main.store.get("c1")["executions"] == 0  # never re-executed
 
     scenario(d, body)
+
+
+# ------------------------------------------------------- recovery verification
+def _sync_asgi(gw_main, method, path, json=None):
+    """Call the async gateway app from sync test code."""
+
+    async def go():
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=gw_main.app), base_url="http://gw"
+        ) as client:
+            return await client.request(method, path, json=json)
+
+    return asyncio.run(go())
+
+
+def wire_recovery(monkeypatch, gw_main, web_main):
+    """Point the web app's recovery fetchers at the gateway ASGI app."""
+
+    def fetch_reports(device_id):
+        resp = _sync_asgi(gw_main, "GET", f"/api/devices/{device_id}/reports")
+        return resp.json()
+
+    def fetch_command(command_id):
+        resp = _sync_asgi(gw_main, "GET", f"/api/commands/{command_id}")
+        return resp.json() if resp.status_code == 200 else {}
+
+    monkeypatch.setattr(web_main, "fetch_reports", fetch_reports)
+    monkeypatch.setattr(web_main, "fetch_command", fetch_command)
+
+
+def gw_report(gw_main, device_id, online, mode="current"):
+    resp = _sync_asgi(
+        gw_main,
+        "POST",
+        f"/api/devices/{device_id}/reports",
+        json={"online": online, "mode": mode},
+    )
+    assert resp.status_code == 201, resp.text
+    return resp.json()
+
+
+def gw_release(gw_main, device_id):
+    resp = _sync_asgi(gw_main, "POST", f"/api/devices/{device_id}/reports/release")
+    return resp.json()
+
+
+def conclusion_of(web_main, device_id):
+    return web_main.recovery_conclusion(device_id)["conclusion"]
+
+
+def test_recovery_flow_end_to_end(services, monkeypatch):
+    """Full arc: execute -> online report -> recovered -> newer offline
+    withdraws -> late old reports cannot override -> new command resets ->
+    new generation required -> restart keeps everything."""
+    gw_main, web_main = services
+    wire_recovery(monkeypatch, gw_main, web_main)
+    transport = httpx.ASGITransport(app=gw_main.app)
+
+    web_main.store.submit(device_id="d1", command_id="c1", deadline=deadline_in())
+    d = make_dispatcher(monkeypatch, web_main, transport)
+    assert drive(d, lambda: web_main.store.get("c1")["state"] == "executed")
+    assert web_main.store.get("c1")["boot_generation"] == 1
+    assert gw_main.store.get_device("d1")["generation"] == 1
+
+    # Executed but no report of the new generation yet.
+    assert conclusion_of(web_main, "d1") == "verify"
+
+    gw_report(gw_main, "d1", online=True)
+    assert conclusion_of(web_main, "d1") == "recovered"
+
+    # A newer offline report withdraws the conclusion.
+    gw_report(gw_main, "d1", online=False)
+    assert conclusion_of(web_main, "d1") == "not_recovered"
+
+    # A late report with an older seq (held, then released) cannot override.
+    gw_report(gw_main, "d1", online=False, mode="hold")   # gen1 seq3, held
+    gw_report(gw_main, "d1", online=True)                 # gen1 seq4 arrives
+    assert gw_release(gw_main, "d1")["released"] == 1     # seq3 arrives late
+    assert conclusion_of(web_main, "d1") == "recovered"
+
+    # A held report from generation 1, released after the next reboot, is an
+    # old-generation report and must not count.
+    gw_report(gw_main, "d1", online=True, mode="hold")    # gen1 seq5, held
+    web_main.store.submit(device_id="d1", command_id="c2", deadline=deadline_in())
+    # New command submitted: the old conclusion is gone immediately.
+    assert conclusion_of(web_main, "d1") == "verify"
+
+    d2 = make_dispatcher(monkeypatch, web_main, transport)
+    assert drive(d2, lambda: web_main.store.get("c2")["state"] == "executed")
+    assert web_main.store.get("c2")["boot_generation"] == 2
+    assert gw_release(gw_main, "d1")["released"] == 1     # stale gen1 arrives
+    # Old-generation online reports are not evidence for the new boot.
+    assert conclusion_of(web_main, "d1") == "verify"
+
+    gw_report(gw_main, "d1", online=True)                 # gen2 seq1
+    assert conclusion_of(web_main, "d1") == "recovered"
+    gw_report(gw_main, "d1", online=False)                # gen2 seq2
+    assert conclusion_of(web_main, "d1") == "not_recovered"
+
+    # Both services restart: the conclusion is recomputed from persisted
+    # state and stays correct.
+    restart()
+    gw_main2, web_main2 = _gw(), _web()
+    wire_recovery(monkeypatch, gw_main2, web_main2)
+    assert web_main2.store.get("c2")["boot_generation"] == 2
+    assert gw_main2.store.get_device("d1")["generation"] == 2
+    assert conclusion_of(web_main2, "d1") == "not_recovered"
+    gw_report(gw_main2, "d1", online=True)                # gen2 seq3
+    assert conclusion_of(web_main2, "d1") == "recovered"
+
+
+def test_recovery_api_and_gateway_outage(services, monkeypatch):
+    gw_main, web_main = services
+    wire_recovery(monkeypatch, gw_main, web_main)
+    transport = httpx.ASGITransport(app=gw_main.app)
+
+    web_main.store.submit(device_id="d1", command_id="c1", deadline=deadline_in())
+    d = make_dispatcher(monkeypatch, web_main, transport)
+    assert drive(d, lambda: web_main.store.get("c1")["state"] == "executed")
+    gw_report(gw_main, "d1", online=True)
+
+    payload = web_main.api_device_recovery("d1")
+    assert payload["conclusion"] == "recovered"
+    assert payload["label"] == "已恢复"
+    assert payload["command_id"] == "c1"
+    assert payload["boot_generation"] == 1
+
+    # Gateway unreachable -> never keep showing a stale "recovered".
+    def down(device_id):
+        from web.app.recovery import GatewayUnreachable
+
+        raise GatewayUnreachable("down")
+
+    monkeypatch.setattr(web_main, "fetch_reports", down)
+    payload = web_main.api_device_recovery("d1")
+    assert payload["conclusion"] == "verify"
+    assert payload["label"] == "待核实"
+
+
+def test_failed_or_unexecuted_command_is_not_recovered(services, monkeypatch):
+    gw_main, web_main = services
+    wire_recovery(monkeypatch, gw_main, web_main)
+
+    web_main.store.submit(device_id="d1", command_id="c1", deadline=deadline_in())
+    web_main.store.claim_batch(retry_seconds=0)
+    web_main.store.finish("c1", state="failed", receipt_status="failed")
+    assert conclusion_of(web_main, "d1") == "not_recovered"
+
+    web_main.store.submit(device_id="d1", command_id="c2", deadline=deadline_in())
+    web_main.store.claim_batch(retry_seconds=0)
+    web_main.store.finish("c2", state="unexecuted")
+    assert conclusion_of(web_main, "d1") == "not_recovered"
+    # Even a device-side online report cannot fix a command that never ran.
+    gw_report(gw_main, "d1", online=True)
+    assert conclusion_of(web_main, "d1") == "not_recovered"

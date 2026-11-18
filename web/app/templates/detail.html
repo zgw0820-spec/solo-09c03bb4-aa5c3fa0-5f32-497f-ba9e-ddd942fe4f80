@@ -36,12 +36,14 @@
 
   <div class="card">
     <dl class="detail-grid">
-      <dt>设备号</dt><dd>{{ cmd.device_id }}</dd>
+      <dt>设备号</dt><dd><a href="/devices/{{ cmd.device_id }}">{{ cmd.device_id }}</a></dd>
       <dt>状态</dt><dd><span class="badge s-{{ cmd.state }}">{{ cmd.state_label }}</span></dd>
       <dt>回执状态</dt><dd>{{ cmd.receipt_status or '—' }}</dd>
       <dt>说明</dt><dd>{{ cmd.detail or '—' }}</dd>
       <dt>下发尝试次数</dt><dd>{{ cmd.attempts }}</dd>
       <dt>回执丢失</dt><dd>{{ '是（正在按指令号核实）' if cmd.receipt_lost else '否' }}</dd>
+      <dt>执行产生的新代次</dt><dd>{{ cmd.boot_generation if cmd.boot_generation is not none else '—' }}</dd>
+      <dt>恢复核查</dt><dd><a href="/devices/{{ cmd.device_id }}">查看该设备的恢复结论 →</a></dd>
       <dt>截止时间</dt><dd>{{ cmd.deadline }}</dd>
       <dt>创建时间</dt><dd>{{ cmd.created_at }}</dd>
       <dt>更新时间</dt><dd>{{ cmd.updated_at }}</dd>

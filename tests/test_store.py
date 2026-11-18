@@ -111,3 +111,48 @@ def test_backoff_prevents_tight_retry(store):
     store.release_to_pending("a1", "not delivered")
     assert store.claim_batch(retry_seconds=5) == []
     assert store.claim_batch(retry_seconds=0)
+
+
+def test_init_migrates_pre_generation_database(tmp_path):
+    """A commands table created before boot generations existed gets the
+    column added without losing data."""
+    import sqlite3
+
+    db = tmp_path / "ops.db"
+    conn = sqlite3.connect(db)
+    conn.execute(
+        "CREATE TABLE commands ("
+        "id INTEGER PRIMARY KEY AUTOINCREMENT, command_id TEXT NOT NULL UNIQUE, "
+        "device_id TEXT NOT NULL, deadline TEXT NOT NULL, state TEXT NOT NULL, "
+        "receipt_status TEXT, detail TEXT, attempts INTEGER NOT NULL DEFAULT 0, "
+        "drop_receipt INTEGER NOT NULL DEFAULT 0, "
+        "receipt_lost INTEGER NOT NULL DEFAULT 0, wire_state TEXT, "
+        "last_attempt_at TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)"
+    )
+    conn.execute(
+        "INSERT INTO commands (command_id, device_id, deadline, state, "
+        "created_at, updated_at) VALUES ('old-1', 'd1', '2030-01-01', "
+        "'executed', 't', 't')"
+    )
+    conn.commit()
+    conn.close()
+
+    s = Store(db)
+    s.init()
+    row = s.get("old-1")
+    assert row["state"] == "executed"
+    assert row["boot_generation"] is None
+    # ...and the backfill path can repair it from the gateway record.
+    assert s.set_boot_generation("old-1", 4)
+    assert s.get("old-1")["boot_generation"] == 4
+    assert not s.set_boot_generation("old-1", 9)  # never overwritten
+    assert s.get("old-1")["boot_generation"] == 4
+
+
+def test_latest_command_for_device_follows_submission_order(store):
+    store.submit(device_id="d1", command_id="a1", deadline=deadline_in(60))
+    store.submit(device_id="d2", command_id="b1", deadline=deadline_in(60))
+    store.submit(device_id="d1", command_id="a2", deadline=deadline_in(60))
+    assert store.latest_command_for_device("d1")["command_id"] == "a2"
+    assert store.latest_command_for_device("d2")["command_id"] == "b1"
+    assert store.latest_command_for_device("d3") is None

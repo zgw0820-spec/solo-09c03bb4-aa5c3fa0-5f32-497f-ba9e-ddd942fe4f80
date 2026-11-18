@@ -16,6 +16,22 @@ States stored per command id:
               cannot prove whether the device was touched, so this id is
               *never* executed again and is reported as "needs human
               reconciliation".
+
+Boot generations and device reports
+-----------------------------------
+A *successful* restart execution bumps the device's boot ``generation`` in
+the same transaction that commits the execution, and the generation is
+stamped onto the execution record (``boot_generation``).  The simulated
+device then emits online/offline *reports*; every report is stamped by the
+gateway with the device's current generation and a per-generation sequence
+number.  Callers never supply either number -- a report's ``(generation,
+seq)`` is always gateway-assigned, so a hand-typed generation is not
+evidence of anything.
+
+A report can be *held* (emitted but not yet arrived) and released later,
+which honestly simulates a late report: it keeps its emission-time
+``(generation, seq)`` even when it arrives after a reboot, so an old
+generation or an old sequence number can never masquerade as fresh.
 """
 from __future__ import annotations
 
@@ -39,10 +55,30 @@ CREATE TABLE IF NOT EXISTS executions (
     executions     INTEGER NOT NULL DEFAULT 0,
     received_at    TEXT NOT NULL,
     executed_at    TEXT,
-    drop_receipt   INTEGER NOT NULL DEFAULT 0
+    drop_receipt   INTEGER NOT NULL DEFAULT 0,
+    boot_generation INTEGER
 );
 
 CREATE INDEX IF NOT EXISTS by_device ON executions(device_id);
+
+CREATE TABLE IF NOT EXISTS devices (
+    device_id  TEXT PRIMARY KEY,
+    generation INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS reports (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    device_id   TEXT NOT NULL,
+    generation  INTEGER NOT NULL,
+    seq         INTEGER NOT NULL,
+    online      INTEGER NOT NULL,
+    arrived     INTEGER NOT NULL DEFAULT 1,
+    emitted_at  TEXT NOT NULL,
+    arrived_at  TEXT
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS report_gen_seq ON reports(device_id, generation, seq);
+CREATE INDEX IF NOT EXISTS report_device ON reports(device_id, id);
 """
 
 
@@ -80,6 +116,15 @@ class GatewayStore:
     def init(self) -> None:
         with self.connect() as conn:
             conn.executescript(SCHEMA)
+            # Migration for databases created before boot generations existed.
+            cols = {
+                row["name"]
+                for row in conn.execute("PRAGMA table_info(executions)")
+            }
+            if "boot_generation" not in cols:
+                conn.execute(
+                    "ALTER TABLE executions ADD COLUMN boot_generation INTEGER"
+                )
         # A command that was mid-flight when the process died has an unknown
         # outcome.  Never turn that into "not executed": the row is frozen as
         # `unknown` so a retried delivery cannot execute it a second time.
@@ -147,6 +192,11 @@ class GatewayStore:
         A delay simulates device work; it happens *before* the transaction so
         no lock is held, but the RUNNING reservation already exists, so a
         concurrent duplicate request cannot execute in parallel.
+
+        A successful restart boots the device into a new generation: the
+        device counter is bumped and stamped onto the execution record in the
+        same transaction, so "executed" and "new boot generation issued" can
+        never disagree.
         """
         if delay_seconds > 0:
             time.sleep(delay_seconds)
@@ -166,6 +216,20 @@ class GatewayStore:
             )
             if cur.rowcount != 1:  # defence in depth: never double-execute
                 raise RuntimeError("execution already committed")
+            if status == "succeeded":
+                conn.execute(
+                    "INSERT INTO devices (device_id, generation) VALUES (?, 1) "
+                    "ON CONFLICT(device_id) DO UPDATE SET generation=generation+1",
+                    (device_id,),
+                )
+                generation = conn.execute(
+                    "SELECT generation FROM devices WHERE device_id=?",
+                    (device_id,),
+                ).fetchone()["generation"]
+                conn.execute(
+                    "UPDATE executions SET boot_generation=? WHERE command_id=?",
+                    (generation, command_id),
+                )
             return conn.execute(
                 "SELECT * FROM executions WHERE command_id=?", (command_id,)
             ).fetchone()
@@ -183,3 +247,67 @@ class GatewayStore:
                 (command_id,),
             )
             return cur.rowcount == 1
+
+    # ---------------------------------------------------- devices and reports
+    def get_device(self, device_id: str) -> Optional[sqlite3.Row]:
+        with self.connect() as conn:
+            return conn.execute(
+                "SELECT * FROM devices WHERE device_id=?", (device_id,)
+            ).fetchone()
+
+    def add_report(
+        self, device_id: str, *, online: bool, arrive: bool = True
+    ) -> sqlite3.Row:
+        """The simulated device emits an online/offline report.
+
+        The gateway -- never the caller -- stamps the report with the
+        device's *current* generation and the next sequence number inside
+        that generation.  With ``arrive=False`` the report is emitted but
+        held "in the network"; it keeps its stamp when released later, which
+        is how a late old report is simulated.
+        """
+        now = utcnow()
+        with self._tx() as conn:
+            dev = conn.execute(
+                "SELECT generation FROM devices WHERE device_id=?", (device_id,)
+            ).fetchone()
+            generation = dev["generation"] if dev is not None else 0
+            seq = conn.execute(
+                "SELECT COALESCE(MAX(seq), 0) + 1 AS next_seq FROM reports "
+                "WHERE device_id=? AND generation=?",
+                (device_id, generation),
+            ).fetchone()["next_seq"]
+            cur = conn.execute(
+                "INSERT INTO reports (device_id, generation, seq, online, "
+                "arrived, emitted_at, arrived_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    device_id,
+                    generation,
+                    seq,
+                    1 if online else 0,
+                    1 if arrive else 0,
+                    now,
+                    now if arrive else None,
+                ),
+            )
+            return conn.execute(
+                "SELECT * FROM reports WHERE id=?", (cur.lastrowid,)
+            ).fetchone()
+
+    def release_reports(self, device_id: str) -> int:
+        """All held reports of the device arrive now, keeping their original
+        (generation, seq) stamps -- they may belong to an old boot by now."""
+        with self._tx() as conn:
+            cur = conn.execute(
+                "UPDATE reports SET arrived=1, arrived_at=? "
+                "WHERE device_id=? AND arrived=0",
+                (utcnow(), device_id),
+            )
+            return cur.rowcount
+
+    def list_reports(self, device_id: str, limit: int = 100) -> list[sqlite3.Row]:
+        with self.connect() as conn:
+            return conn.execute(
+                "SELECT * FROM reports WHERE device_id=? ORDER BY id DESC LIMIT ?",
+                (device_id, limit),
+            ).fetchall()
